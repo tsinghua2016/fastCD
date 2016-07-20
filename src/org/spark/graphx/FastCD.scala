@@ -8,35 +8,18 @@ import org.apache.spark.graphx.EdgeTriplet
 import org.apache.spark.rdd.RDD
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
-import java.util.Date
-class NodeData(val nodeid:Long,var communityID:Long) extends Serializable {
-
-  var li:Long=0
-  var q:Double=0.0
-  var update:Boolean=false
-  var si:Long=0
- override def  toString:String=
-   "nodeid =>"+nodeid+" li=>"+li +" q => "+q+" communityID "+communityID+" update "+update +" si => "+si
-
-}
 object FastCD {
-var debug=false
-  //节点数据更新
+ 
+ // update the information of nodes
  def updateNodeData(graph: Graph[NodeData, Long]):RDD[(VertexId, NodeData)]={
-   var temp=graph.aggregateMessages[(Long,Long,Long,Long,NodeData)](//边  社区id  li si节点
+   graph.aggregateMessages[(Long,Long,Long,Long,NodeData)](
+       //edges attribute,  the communityId of sender, Ic ,Sc,the information of receiver
             triplet =>
-             // if(triplet.srcAttr.communityID!=triplet.dstAttr.communityID){ 
               {   triplet.sendToDst(triplet.attr,triplet.srcAttr.communityID,0,0,triplet.dstAttr)
                 triplet.sendToSrc(triplet.attr,triplet.dstAttr.communityID,0,0,triplet.srcAttr)
-                
-          /*    }
-              else if(triplet.srcId==triplet.dstId)
-              {
-                triplet.sendToSrc(triplet.attr,triplet.dstAttr.communityID,0,triplet.srcAttr)
-              }*/
                } ,
            
-         (a,b)=>
+         (a,b)=> // reduce message if receiver receive more than one message
            {
              var li=b._3+a._3
                li+=a._1
@@ -52,35 +35,21 @@ var debug=false
               }
              (0L,-1L,li,si,a._5)
            } 
-        ).map{x=> 
+        ).map{// create new vertice
+     x=>  
          var node=new NodeData(x._2._5.nodeid,x._2._5.communityID)
          var li=x._2._3
          var si=x._2._4
          if(li==0 )li=x._2._1
          if( si==0 && x._2._2!=x._2._5.communityID) si=x._2._1
          
-          node.li=li
-          node.si=si
-         
+          node.communityDegreeSum=li
+          node.neighCommunityDegreeSum=si
          Tuple2(x._1,node)
         }
-   if(debug)
-   {
-    var tt=temp.collect()
-     var sum=0L
-     for(i <-0 until tt.length)
-       {
-         println(tt(i)._2)
-         sum+=tt(i)._2.li
-       }
-     println("sum=>"+sum)
-   }
-     temp
  } 
  
  def distributeCommunity(graph: Graph[NodeData, Long],w:Broadcast[Long]):Graph[NodeData,Long]={
-   //分配新社区
-  
       var old=graph.vertices
        var newvertexRDD:RDD[(VertexId, NodeData)]= graph.aggregateMessages[(Long,NodeData,NodeData,Double)](
           
@@ -92,8 +61,8 @@ var debug=false
             {
              var avalue=0.0
              var bvalue=0.0
-            if(a._1!=0) avalue=(w.value*a._1-a._2.si*a._3.li)/(2.0*w.value*w.value)
-             if(b._1!=0) bvalue=(w.value*b._1-b._2.si*b._3.li)/(2.0*w.value*w.value)
+            if(a._1!=0) avalue=(w.value*a._1-a._2.neighCommunityDegreeSum*a._3.communityDegreeSum)/(2.0*w.value*w.value)
+             if(b._1!=0) bvalue=(w.value*b._1-b._2.neighCommunityDegreeSum*b._3.communityDegreeSum)/(2.0*w.value*w.value)
              if(avalue<=0 && bvalue<=0) (0,null,null,0)
              else if(avalue>bvalue)(a._1,a._2,a._3,avalue)
              else (b._1,b._2,b._3,bvalue)
@@ -102,22 +71,22 @@ var debug=false
         data=>
           {  
             var node=new NodeData(data._1,data._2._2.communityID)
-            node.li=data._2._3.li
-            node.q=data._2._4
+            node.communityDegreeSum=data._2._3.communityDegreeSum
+            node.Q=data._2._4
            //node.sci=data._2._3.sci
-            node.update=true
+            node.isUpdate=true
            Tuple2(data._1,node)
           }
         }
 
      newvertexRDD=old.union(newvertexRDD).reduceByKey{
-         (x,y)=>if(x.update) {
-           x.update=false
+         (x,y)=>if(x.isUpdate) {
+           x.isUpdate=false
            x
          }
          else
           {
-           y.update=false
+           y.isUpdate=false
            y
           }
          
@@ -134,14 +103,14 @@ var debug=false
              {
                 node=tri.dstAttr
                 node.communityID=tri.srcAttr.communityID
-                node.update=true
+                node.isUpdate=true
                 tri.sendToDst(node)
              }
              else if(tri.srcAttr.communityID==tri.dstAttr.nodeid && tri.dstAttr.communityID!=tri.dstAttr.nodeid)
              {
                 node=tri.srcAttr
                 node.communityID=tri.dstAttr.communityID
-                node.update=true
+                node.isUpdate=true
                 tri.sendToSrc(node)
              }
            
@@ -151,32 +120,22 @@ var debug=false
        )
      
       newvertexRDD=newvertexRDD.union(subRdd).reduceByKey{
-         (x,y)=>if(x.update) {
-           x.update=false
+         (x,y)=>if(x.isUpdate) {
+           x.isUpdate=false
            x
          }
          else
           {
-           y.update=false
+           y.isUpdate=false
            y
           }
          
        }
-       if(debug)
-       {
-         println("##### distribute result #####")
-         var s=newvertexRDD.collect()
-         var si=s.iterator
-         while(si.hasNext)
-           println(si.next)
-         println("#####distribute result end#####")           
-       }
+
        tgraph= Graph(newvertexRDD,tgraph.edges).cache() 
        pregraph.unpersist(false)
        pregraph=tgraph
-       //更新图数据
        var edges=EdgesReduce(tgraph)
-       
        tgraph= Graph(newvertexRDD,edges).cache() 
        pregraph.unpersist(false)
        pregraph=tgraph
@@ -187,9 +146,10 @@ var debug=false
        pregraph.unpersist(false)
        Graph(newvertexRDD,edges)
  }
+ // update the information of edges
 def EdgesReduce(graph: Graph[NodeData, Long]):RDD[Edge[Long]]={
 
-            var e=graph.triplets.map{f=>
+            graph.triplets.map{f=>
                Edge(f.srcAttr.communityID,f.dstAttr.communityID,(f.attr))
              }.flatMap { 
                e=>
@@ -206,109 +166,59 @@ def EdgesReduce(graph: Graph[NodeData, Long]):RDD[Edge[Long]]={
                    var src=e._1.split("-")
                    Edge(src(0).toLong,src(1).toLong,e._2)
                  }
-             }
-             if(debug)
-             {
-               println("\n#### EdgesReduce result######\n")
-               var i=e.collect().iterator
-               var isum=0L
-               while(i.hasNext)
-               {
-                 var t=i.next()
-                 println(t)
-                 isum+=t.attr
-               }
-               println("sum =>"+isum)
-               println("\n#####EdgesReduce result end#####\n")
-               }
-             e
-             
+             }  
 } 
- 
- def main(args:Array[String])
+
+// execute fastCD Algorithm 
+ def run(sc:SparkContext,edgesFile:String, numPartitions:Int,verticeFile:String)=
   {
-   
-        if(args.length<3){
-          println("Param:<edgesFile> <verticeFile> <numPartitions> [debug]")
-          System.exit(0)
-        }
-        if(args.length==4)
-          debug=args(3).toBoolean
         var run=true
-        val starttime=new Date().getTime
-        val edgesFile=args(0)
-        val verticeFile=args(1)
-        val numPartitions=args(2).toInt
-        val sf = new SparkConf().setAppName("Spark Graphx FastCD")
-        val sc = new SparkContext(sf)
          var edges:RDD[Edge[(Long)]]=sc.textFile(edgesFile, numPartitions).map{
           line=>
               var record=line.split('\t')
               if(record.length!=2) record=line.split(' ')
               Edge(record(0).toLong,record(1).toLong,(1L))
           }
-        val w = sc.broadcast(edges.reduce((x1,x2)=>new Edge(x1.srcId,x2.dstId,x1.attr+x2.attr)).attr)
-      
-      if(debug )println("W => "+w.value)
- 
-
+       //count w.value
+       val w = sc.broadcast(edges.reduce((x1,x2)=>new Edge(x1.srcId,x2.dstId,x1.attr+x2.attr)).attr)
        var vertices:RDD[(VertexId, NodeData)]= sc.textFile(verticeFile, numPartitions).map(line => {  
                 var lineLong=line.toLong
                 var node=new NodeData(lineLong,lineLong)
                 Tuple2(lineLong,node)
             })
-        
-   /*     var graph:Graph[NodeData,Long]= _
-        var pregraph:Graph[NodeData,Long]= _*/
-
-         var graph= Graph(vertices,edges).cache() 
-          //初始化节点数据
-
-        var pregraph=graph
-        var newnum:Long=0L
-    
-        println("verteices => "+vertices.count()+" ; edges => "+edges.count())
+        var graph= Graph(vertices,edges).cache() 
+         // the pregraph is used for release the cache of graph
+        var pregraph=graph 
+        // count the number of vertices if the property named Q in NodeData is more than 0
+        var newnum:Long=0L 
         var newvertexRDD=updateNodeData(graph)
         graph= Graph(newvertexRDD,edges).cache() 
         pregraph.unpersist(blocking=false)
         pregraph=graph
-        //var graphb=sc.broadcast(graph)
- 
       do{
-       
-       if(debug)
-       {
-         println("\n$$$$$$$$ Community message$$$$$$$$$\n")
-         var itri=graph.triplets.collect().iterator
-         while(itri.hasNext)
-            println(itri.next())
-         println("\n$$$$$$$$Community message end $$$$$$$$$\n")
-       }
-      
-      //分配新社区
         graph= distributeCommunity(graph,w)
         graph.cache()
         pregraph.unpersist(false)
         pregraph.edges.unpersist(false)
-        newnum=graph.vertices.filter(x=>x._2.q>0).count()
-       if(debug) println("q temp =>"+newnum)
-
-          if(newnum==0) run=false 
-       
-          
-          
+        newnum=graph.vertices.filter(x=>x._2.Q>0).count()
+        if(newnum==0) run=false 
      }while(run)
-     val endtime=new Date().getTime
-      val ss=(endtime-starttime)/(1000)
-      println("Runtime "+ss+"s")
-     
-     val Qs=graph.aggregateMessages[(NodeData)](
+       
+     graph
+
+  }
+ def getQAndCommunityNumbers(sc:SparkContext,graph: Graph[NodeData, Long])={
+ val w = sc.broadcast(graph.edges.reduce((x1,x2)=>new Edge(x1.srcId,x2.dstId,x1.attr+x2.attr)).attr)
+  val Qs=graph.aggregateMessages[(NodeData)](
        {tri=>
          if(tri.srcAttr.communityID==tri.dstAttr.communityID ) 
+         {
          if(tri.srcAttr.nodeid==tri.srcAttr.communityID)tri.sendToSrc(tri.srcAttr) 
          else if(tri.dstAttr.nodeid==tri.dstAttr.communityID)
            tri.sendToDst(tri.dstAttr) 
+         }
        },
+       //  find the nodes that can represent different communities.If the number of message is more than one ,a must equal b
          (a,b)=> 
            {
             a
@@ -316,29 +226,22 @@ def EdgesReduce(graph: Graph[NodeData, Long]):RDD[Edge[Long]]={
      ).map{
        x=>
          {
-           val Sc=x._2.si
-           val Ic=x._2.li
+           val Sc=x._2.neighCommunityDegreeSum
+           val Ic=x._2.communityDegreeSum
            val ID=x._2.communityID
            val q=(Ic-Sc*Sc*1.0/(2*w.value))/(2*w.value)
            Tuple2(ID,q)
          }    
-     }.collect()
+}.collect()
      val iter=Qs.iterator
      var sum=0.0
      var number=0L
-     println("++++++ Q +++++++")
      while(iter.hasNext)
      {
        var line=iter.next()
-       if(debug)println(line)
        sum+=line._2
        number+=1
      }
-     println("Q => "+sum)
-     println("++++++++++++++++")
-     
-     println("The number of community is "+number)  
-
-
-  }
+     Tuple2(sum,number)
+ }
 }
